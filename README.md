@@ -125,6 +125,10 @@ cargo check
 cargo test
 ```
 
+## License
+
+Open source under the MIT License. See [LICENSE](./LICENSE).
+
 ## Production Gaps
 
 Do not deploy this backend to production until these are done:
