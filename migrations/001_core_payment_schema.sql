@@ -1,3 +1,8 @@
+-- Core payment, auth, ledger, reconciliation, and payout schema.
+-- This migration defines the PostgreSQL source of truth for merchant sessions,
+-- invoices, Stellar payment observations, payout state, and immutable ledger
+-- entries so browser callbacks never decide money truth.
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
   filename text PRIMARY KEY,
   applied_at timestamptz NOT NULL DEFAULT now()
@@ -34,6 +39,17 @@ CREATE TABLE IF NOT EXISTS merchant_users (
   password_hash text NOT NULL,
   role text NOT NULL CHECK (role IN ('owner', 'admin', 'viewer')),
   status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS merchant_sessions (
+  id text PRIMARY KEY,
+  merchant_user_id text NOT NULL REFERENCES merchant_users(id) ON DELETE CASCADE,
+  token_hash text NOT NULL UNIQUE,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  last_seen_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -320,6 +336,7 @@ EXECUTE FUNCTION prevent_posted_ledger_transaction_mutation();
 
 CREATE INDEX IF NOT EXISTS invoices_merchant_created_idx ON invoices(merchant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS invoices_public_state_idx ON invoices(public_id, state);
+CREATE INDEX IF NOT EXISTS merchant_sessions_user_idx ON merchant_sessions(merchant_user_id, expires_at DESC);
 CREATE INDEX IF NOT EXISTS payment_attempts_invoice_idx ON payment_attempts(invoice_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS payouts_merchant_state_idx ON payouts(merchant_id, state);
 CREATE INDEX IF NOT EXISTS ledger_entries_transaction_idx ON ledger_entries(ledger_transaction_id);

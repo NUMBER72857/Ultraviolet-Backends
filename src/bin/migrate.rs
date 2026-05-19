@@ -1,3 +1,8 @@
+//! Raw SQL migration runner.
+//!
+//! The backend intentionally keeps migrations simple and inspectable: this
+//! binary applies the core schema file and records it in `schema_migrations`.
+
 use sqlx::postgres::PgPoolOptions;
 use std::{env, time::Duration};
 

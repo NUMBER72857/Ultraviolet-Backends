@@ -1,3 +1,8 @@
+//! Exact-money helpers for Stellar USDC atomic units.
+//!
+//! All payment amounts are integer atomic units with seven decimals; this file
+//! prevents floating-point drift and validates invoice fee splits before writes.
+
 #[allow(dead_code)]
 pub const STELLAR_ATOMIC_SCALE: i64 = 10_000_000;
 

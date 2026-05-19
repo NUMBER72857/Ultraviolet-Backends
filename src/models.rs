@@ -1,3 +1,8 @@
+//! Database-backed API projections.
+//!
+//! These structs define the stable JSON shape returned by handlers while
+//! preserving integer money values as strings for JavaScript clients.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use sqlx::FromRow;

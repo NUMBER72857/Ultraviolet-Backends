@@ -1,3 +1,8 @@
+//! HTTP error mapping for the API boundary.
+//!
+//! Handlers use this type to keep response bodies consistent while still
+//! logging internal failures without leaking database details or PII.
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -12,6 +17,8 @@ pub enum ApiError {
     Database(sqlx::Error),
     Internal(&'static str),
     NotFound(&'static str),
+    TooManyRequests(&'static str),
+    Unauthorized(&'static str),
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -36,6 +43,16 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(message) => {
                 (StatusCode::NOT_FOUND, "not_found", message.to_string())
             }
+            ApiError::TooManyRequests(message) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_requests",
+                message.to_string(),
+            ),
+            ApiError::Unauthorized(message) => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                message.to_string(),
+            ),
             ApiError::Internal(message) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

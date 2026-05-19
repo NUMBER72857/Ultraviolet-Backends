@@ -1,13 +1,26 @@
+//! Axum entrypoint and invoice API composition.
+//!
+//! This file wires together configuration, database state, HTTP hardening,
+//! merchant authentication, invoice handlers, and background worker startup.
+
+mod auth;
 mod config;
 mod db;
 mod error;
+mod http;
 mod models;
 mod money;
+mod payouts;
+mod reconciliation;
+mod stellar;
+
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
-    routing::get,
+    middleware,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -17,40 +30,82 @@ use models::InvoiceRecord;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use uuid::Uuid;
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     config: Config,
     pool: PgPool,
+    rate_limiter: Arc<http::RateLimiter>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let config = Config::from_env().map_err(|message| format!("configuration error: {message}"))?;
     let pool = db::connect(&config.database_url).await?;
+    reconciliation::spawn(
+        pool.clone(),
+        reconciliation::ReconciliationWorkerConfig {
+            enabled: config.reconciliation_worker_enabled,
+            interval_seconds: config.reconciliation_interval_seconds,
+        },
+    );
+    payouts::spawn(
+        pool.clone(),
+        payouts::PayoutWorkerConfig {
+            enabled: config.payout_worker_enabled,
+            interval_seconds: config.payout_interval_seconds,
+        },
+    );
+
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
 
-    let app = app(AppState { config, pool });
+    let app = app(AppState {
+        rate_limiter: Arc::new(http::RateLimiter::new(config.rate_limit_per_minute)),
+        config,
+        pool,
+    })?;
     tracing::info!(addr = %listener.local_addr()?, "ultraviolet backend listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-fn app(state: AppState) -> Router {
-    Router::new()
+fn app(state: AppState) -> Result<Router, String> {
+    let cors = http::cors_layer(&state.config.cors_allowed_origin)?;
+    let body_limit = http::body_limit_layer(state.config.max_json_body_bytes);
+
+    Ok(Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/v1/auth/login", post(login))
+        .route("/v1/auth/logout", post(logout))
         .route("/v1/invoices", get(list_invoices).post(create_invoice))
         .route("/v1/invoices/:id", get(get_invoice))
+        .route(
+            "/v1/invoices/:id/payment-attempts",
+            post(submit_payment_attempt),
+        )
         .route("/v1/public/invoices/:public_id", get(get_public_invoice))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            http::rate_limit,
+        ))
+        .layer(body_limit)
+        .layer(cors)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(
+                DefaultMakeSpan::new()
+                    .include_headers(false)
+                    .level(tracing::Level::INFO),
+            ),
+        )
+        .with_state(state))
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -71,15 +126,46 @@ async fn ready(State(state): State<AppState>) -> Result<Json<ReadyResponse>, Api
         stellar_horizon_url: state.config.stellar_horizon_url,
         platform_fee_bps: state.config.platform_fee_bps,
         session_secret_configured: state.config.session_secret.len() >= 32,
+        reconciliation_worker_enabled: state.config.reconciliation_worker_enabled,
+        payout_worker_enabled: state.config.payout_worker_enabled,
     }))
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(payload): Json<auth::LoginRequest>,
+) -> Result<Json<auth::LoginResponse>, ApiError> {
+    auth::login(
+        &state.pool,
+        &state.config.session_secret,
+        state.config.session_ttl_hours,
+        payload,
+    )
+    .await
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<OkResponse>, ApiError> {
+    auth::logout(&state.pool, &state.config.session_secret, &headers).await?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn list_invoices(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<ListInvoicesQuery>,
 ) -> Result<Json<Vec<InvoiceRecord>>, ApiError> {
+    let auth = auth::require_auth(&state.pool, &state.config.session_secret, &headers).await?;
+    if let Some(merchant_id) = query.merchant_id.as_deref() {
+        if merchant_id != auth.merchant_id {
+            return Err(ApiError::Unauthorized("cannot access another merchant"));
+        }
+    }
+
     let invoices = sqlx::query_as::<_, InvoiceRecord>(INVOICE_SELECT_BY_MERCHANT)
-        .bind(query.merchant_id)
+        .bind(auth.merchant_id)
         .fetch_all(&state.pool)
         .await?;
 
@@ -88,13 +174,19 @@ async fn list_invoices(
 
 async fn get_invoice(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<InvoiceRecord>, ApiError> {
+    let auth = auth::require_auth(&state.pool, &state.config.session_secret, &headers).await?;
     let invoice = sqlx::query_as::<_, InvoiceRecord>(INVOICE_SELECT_BY_ID)
         .bind(id)
         .fetch_optional(&state.pool)
         .await?
         .ok_or(ApiError::NotFound("invoice not found"))?;
+
+    if invoice.merchant_id != auth.merchant_id {
+        return Err(ApiError::NotFound("invoice not found"));
+    }
 
     Ok(Json(invoice))
 }
@@ -117,6 +209,14 @@ async fn create_invoice(
     headers: HeaderMap,
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> Result<Json<InvoiceRecord>, ApiError> {
+    let auth = auth::require_auth(&state.pool, &state.config.session_secret, &headers).await?;
+    require_write_role(&auth)?;
+    if payload.merchant_id != auth.merchant_id {
+        return Err(ApiError::Unauthorized(
+            "cannot create invoices for another merchant",
+        ));
+    }
+
     money::validate_fee_split(
         payload.gross_amount_atomic,
         payload.platform_fee_atomic,
@@ -230,12 +330,13 @@ async fn create_invoice(
 
     sqlx::query(
         r#"
-        INSERT INTO audit_logs (id, merchant_id, action, entity_type, entity_id, metadata)
-        VALUES ($1, $2, 'invoice_created', 'invoice', $3, $4)
+        INSERT INTO audit_logs (id, merchant_id, actor_user_id, action, entity_type, entity_id, metadata)
+        VALUES ($1, $2, $3, 'invoice_created', 'invoice', $4, $5)
         "#,
     )
     .bind(prefixed_id("aud"))
     .bind(&payload.merchant_id)
+    .bind(&auth.user_id)
     .bind(&invoice.id)
     .bind(serde_json::json!({
         "gross_amount_atomic": invoice.gross_amount_atomic,
@@ -247,6 +348,68 @@ async fn create_invoice(
 
     tx.commit().await?;
     Ok(Json(invoice))
+}
+
+async fn submit_payment_attempt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<SubmitPaymentAttemptRequest>,
+) -> Result<Json<OkResponse>, ApiError> {
+    let auth = auth::require_auth(&state.pool, &state.config.session_secret, &headers).await?;
+    require_write_role(&auth)?;
+    let transaction_hash = payload.transaction_hash.trim();
+    if transaction_hash.is_empty() || transaction_hash.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "transaction_hash is required and must be short",
+        ));
+    }
+
+    let invoice = sqlx::query_as::<_, InvoiceRecord>(INVOICE_SELECT_BY_ID)
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(ApiError::NotFound("invoice not found"))?;
+
+    if invoice.merchant_id != auth.merchant_id {
+        return Err(ApiError::NotFound("invoice not found"));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO payment_attempts (id, invoice_id, transaction_hash, status, message)
+        VALUES ($1, $2, $3, 'submitted', 'submitted by authenticated merchant')
+        ON CONFLICT (transaction_hash) WHERE transaction_hash IS NOT NULL DO NOTHING
+        "#,
+    )
+    .bind(prefixed_id("pat"))
+    .bind(&invoice.id)
+    .bind(transaction_hash)
+    .execute(&state.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (id, merchant_id, actor_user_id, action, entity_type, entity_id, metadata)
+        VALUES ($1, $2, $3, 'payment_attempt_submitted', 'invoice', $4, $5)
+        "#,
+    )
+    .bind(prefixed_id("aud"))
+    .bind(&auth.merchant_id)
+    .bind(&auth.user_id)
+    .bind(&invoice.id)
+    .bind(serde_json::json!({ "transaction_hash": transaction_hash }))
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(OkResponse { ok: true }))
+}
+
+fn require_write_role(auth: &auth::AuthContext) -> Result<(), ApiError> {
+    match auth.role.as_str() {
+        "owner" | "admin" => Ok(()),
+        _ => Err(ApiError::Unauthorized("role cannot modify invoice state")),
+    }
 }
 
 fn read_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
@@ -315,7 +478,7 @@ LIMIT 100
 
 #[derive(Deserialize)]
 struct ListInvoicesQuery {
-    merchant_id: String,
+    merchant_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -328,6 +491,11 @@ struct CreateInvoiceRequest {
     platform_fee_atomic: i64,
     merchant_net_atomic: i64,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct SubmitPaymentAttemptRequest {
+    transaction_hash: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -349,6 +517,13 @@ struct ReadyResponse {
     stellar_horizon_url: String,
     platform_fee_bps: u16,
     session_secret_configured: bool,
+    reconciliation_worker_enabled: bool,
+    payout_worker_enabled: bool,
+}
+
+#[derive(Serialize)]
+struct OkResponse {
+    ok: bool,
 }
 
 #[cfg(test)]

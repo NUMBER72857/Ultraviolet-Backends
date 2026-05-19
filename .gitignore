@@ -1,3 +1,7 @@
+# Repository ignore rules.
+# Keeps local secrets, logs, and Rust build artifacts out of source control
+# while allowing the documented `.env.example` template to stay versioned.
+
 /target
 .env
 .env.*
